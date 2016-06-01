@@ -6,13 +6,20 @@ sum_diffs <- function(l) {rowSums(1/(outer(l, l, '-') + diag(Inf, length(l))))}
 # vector with ith component \sum_{j \neq i} l_j/(l_i-l_j)^2; appears in UBEOR expression
 sum_diffs_lj <- function(l) {rowSums(t(l/(t(outer(l, l, '-')^2) + diag(Inf, length(l)))))}
 
-# Computes Sparse-Stein covariance estmator
+# Computes the sparse-Stein covariance estimate for the given sample covariance
+# Parameters
+# ----------
 # S: sample covariance matrix (UNSCALED, i.e. X'T %*% X)
 # n: number of samples
 # lambda: l_1 penalty parameter
 # rho: Frobenius norm penalty parameter
 # delta: "adaptive lasso" penalty parameter; increase to penalize small values
 #        more strongly ("adaptive Sparse Stein" <--> delta=2)
+# Outputs
+# -------
+# Theta: estimated covariance
+# phi: eigenvalues of un-thresholded estimate
+# H: eigenvectors of un-thresholded estimate
 sparse_stein_cov <- function(S, n, lambda, rho, delta=0, tol=1e-3, max_it=500) {
   p <- nrow(S)
   decomp <- eigen(S, symmetric=TRUE)
@@ -49,16 +56,23 @@ sparse_stein_cov <- function(S, n, lambda, rho, delta=0, tol=1e-3, max_it=500) {
       }
     }
   }
-  return(list(phi=phi, H=H, Theta=Theta, i=i))
+  return(list(phi=phi, H=H, Theta=Theta))
 }
 
-# Computes sparse Stein inverse covariance estimator
+# Computes the sparse-Stein inverse covariance estimate for the given sample covariance
+# Parameters
+# ----------
 # S: sample covariance matrix (UNSCALED, i.e. X'T %*% X)
 # n: number of samples
 # lambda: l_1 penalty parameter
 # rho: Frobenius norm penalty parameter
 # delta: "adaptive lasso" penalty parameter; increase to penalize small values
 #        more strongly ("adaptive Sparse Stein" <--> delta=2)
+# Outputs
+# -------
+# Theta: estimated inverse covariance
+# phi: eigenvalues of un-thresholded estimate
+# H: eigenvectors of un-thresholded estimate
 sparse_stein_inv <- function(S, n, lambda, rho, loss='F', delta=0, tol=1e-3, max_it=500) {
   p <- nrow(S)
   decomp <- eigen(S, symmetric=TRUE)

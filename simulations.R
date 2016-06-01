@@ -1,15 +1,11 @@
-# NOTE use 1/rho instead of rho (original parametrization)
-# NOTE rho==Inf --> soft thresholding? is this used in simulations?
+# NOTE definition of rho here is different from paper: new rho = 1/rho (original parametrization)
 
-#install.packages(c('mvtnorm', 'ggplot2', 'reshape', 'svd', 'spcov'))
-#source("http://bioconductor.org/biocLite.R"); biocLite(); biocLite("genefilter")
+#install.packages(c('mvtnorm', 'ggplot2', 'reshape', 'svd', 'spcov', 'Iso'))
 library(mvtnorm)
 library(ggplot2)
 library(reshape)
 library(svd)
 library(spcov)
-library(Biobase)
-library(genefilter)
 source('GGDescent_patch.R')
 source('cglasso.R')
 source('sparse_stein.R')
@@ -94,11 +90,12 @@ lambda_search <- function(func, S, n, num_edges, lambda_min=0, lambda_max=5, N_l
 }
 
 # Iterate over grid of penalty parameters and return cv scores / sparsity levels
-cv_paths <- function(estimator, S, X, n, lambda_range, rho_range) {
+cv_paths <- function(estimator, S, X, n, lambda_range, rho_range, fold=10) {
   cv_table <- t(sapply(lambda_range, function(lambda) {
     colMeans(cv(rho_range, X, function(X_i,rho) {
-      list(Omega=solve(estimator(cov(X_i), nrow(X_i), lambda, rho)))}
-    ))}
+      cat(sprintf('lambda=%f, rho=%f (%s)\n', lambda, rho, Sys.time()))
+      list(Omega=solve(estimator(cov(X_i), nrow(X_i), lambda, rho)))},
+      fold=fold))}
   ))
   nnz_table <- outer(lambda_range, rho_range,
                      Vectorize(function(lambda, rho) {
@@ -229,28 +226,32 @@ bien_tibs_sigmas <- function(p, num_blocks, nz_prob, MA_const, kappa_star) {
   return(Sigma_list)
 }
 
-cov_glasso_sim <- function(estimators, p, n, N, num_sparsity_levels=401, save_data=TRUE) {
+# Main simulation function: runs simulations for Bien/Tibshirani test cases and returns
+# information about accuracy/model selection for each penalty parameter value
+cov_glasso_sim <- function(estimators, p, n, N, k_range=NULL, num_sparsity_levels=401, save_data=TRUE) {
   set.seed(3)
+  save_data <- TRUE
   num_blocks <- 5
   nz_prob <- 0.02
   MA_const <- 0.4
   Sigma_list <- bien_tibs_sigmas(p, num_blocks, nz_prob, MA_const, p)
 
-  lambda_range <- rev(lseq(1e-5, 30, num_sparsity_levels)[-1])
-  rho_range <- 1/c(lseq(2, 1000, len=20),Inf)
-  tau_range <- seq(0, 2, len=21)
+ lambda_range <- rev(lseq(1e-3, 25, num_sparsity_levels)[-1])
+  rho_range <- 1/c(lseq(2, 1000, len=10),Inf)
+  tau_range <- seq(0, 2, len=10)
   num_edges_range <- round(seq(1, choose(p,2)*0.9, len=num_sparsity_levels))[-1]
 
   full_data <- data.frame(k=integer(), i=integer(),
-                          algorithm=factor(levels=c('Cov Glasso','Soft','Stein Soft',
-                                                    'Sparse Stein','Stein Hard','ECM',
-                                                    'Adaptive Sparse Stein','Xue','Liu')),
+                          algorithm=factor(levels=c('Cov Glasso', 'Cov Glasso CV',
+                                                    'Sparse Stein', 'Adaptive Sparse Stein',
+                                                    'Xue','Liu')),
                           lambda=numeric(), rho=numeric(), tp=integer(),
                           fp=integer(), tn=integer(), fn=integer(),
                           rmse=numeric(), entropy=numeric(), min_eig=numeric(),
                           cv_score=numeric())
   all_plots <- list()
-  for (k in seq_along(Sigma_list)) {
+  if (is.null(k_range)) {k_range <- seq_along(Sigma_list)}
+  for (k in k_range) {
     X_list <- replicate(N, rmvnorm(n, rep(0,p), Sigma_list[[k]]), simplify=FALSE)
     S_list <- lapply(X_list, function(X_i) t(X_i) %*% X_i)
     for (i in 1:N) {
@@ -267,13 +268,15 @@ cov_glasso_sim <- function(estimators, p, n, N, num_sparsity_levels=401, save_da
 
       # Used for test case where a single estimator is selected via cross-validation
       if ('Cov Glasso CV' %in% estimators) {
-        cv_out <- cv_paths(function(S,n,lambda,rho) tryCatch(spcov(S_list[[i]]/n+1e-3*diag(p), S_list[[i]]/n+1e-3*diag(p), lambda, 100)$Sig, error=function(e) NA), S_list[[i]]/n, X_list[[i]], n, lambda_range, Inf)
+        cv_out <- cv_paths(function(S,n,lambda,rho) tryCatch(spcov(diag(diag(S_list[[i]]))/n+1e-3*diag(p), S_list[[i]]/n+1e-3*diag(p), lambda, 100)$Sig, error=function(e) NA), S_list[[i]]/n, X_list[[i]], n, lambda_range, Inf, fold=5)
         for (j in seq_along(lambda_range)) {
           lambda <- lambda_range[j]
           cv_score <- cv_out$cv_table[j]
-          spcov_out <- tryCatch(spcov(S_list[[i]]/n+1e-3*diag(p), S_list[[i]]/n+1e-3*diag(p), lambda, 100), error=function(e) list(Sigma=NA))
-          spcov_stats <- check_Sigma(spcov_out$Sig, Sigma_list[[k]])
-          full_data[nrow(full_data)+1,] <- c(k, i, 'Cov Glasso CV', lambda, Inf, spcov_stats, cv_score)
+          spcov_out <- tryCatch(spcov(S_list[[i]]/n+1e-3*diag(p), S_list[[i]]/n+1e-3*diag(p), lambda, 100, n.outer.steps=100, n.inner.steps=100), error=function(e) list(Sigma=NA))
+          if (!is.na(spcov_out$Sigma)) {
+            spcov_stats <- check_Sigma(spcov_out$Sig, Sigma_list[[k]])
+            full_data[nrow(full_data)+1,] <- c(k, i, 'Cov Glasso CV', lambda, Inf, spcov_stats, cv_score)
+          }
         }
       }
 
@@ -314,7 +317,7 @@ cov_glasso_sim <- function(estimators, p, n, N, num_sparsity_levels=401, save_da
       }
 
       if ('Xue' %in% estimators) {
-        cv_out <- cv_paths(function(S,n,lambda,tau) xue_cov(S,lambda,tau,tol=1e-3,max_it=100), S_list[[i]]/n, X_list[[i]], n, lambda_range, tau_range)
+        cv_out <- cv_paths(function(S,n,lambda,tau) xue_cov(S,lambda,tau,tol=1e-2,max_it=20), S_list[[i]]/n, X_list[[i]], n, lambda_range, tau_range)
         for (j in seq_along(num_edges_range)[-1]) {
           matching_inds <- which(cv_out$nnz_table >= num_edges_range[j-1] & cv_out$nnz_table <= num_edges_range[j], arr.ind=TRUE)
           if (nrow(matching_inds) > 0) {
@@ -332,7 +335,7 @@ cov_glasso_sim <- function(estimators, p, n, N, num_sparsity_levels=401, save_da
       }
 
       if ('Liu' %in% estimators) {
-        cv_out <- cv_paths(function(S,n,lambda,tau) liu_cov(S,lambda,tau,tol=1e-3,max_it=100), S_list[[i]]/n, X_list[[i]], n, lambda_range, tau_range)
+        cv_out <- cv_paths(function(S,n,lambda,tau) liu_cov(S,lambda,tau,tol=1e-2,max_it=20), S_list[[i]]/n, X_list[[i]], n, lambda_range, tau_range)
         for (j in seq_along(num_edges_range)[-1]) {
           matching_inds <- which(cv_out$nnz_table >= num_edges_range[j-1] & cv_out$nnz_table <= num_edges_range[j], arr.ind=TRUE)
           if (nrow(matching_inds) > 0) {
@@ -353,13 +356,13 @@ cov_glasso_sim <- function(estimators, p, n, N, num_sparsity_levels=401, save_da
       full_data$specificity <- full_data$tn/(full_data$fp + full_data$tn)
       full_data$nnz <- full_data$tp + full_data$fp
 
-      if (!exists('filename')) {
-        if (length(unique(full_data$i)) > 1) {
+#     if (!exists('filename')) {
+      if (N > 1) {
           filename <- sprintf('%s_p%i_k%i.RData', paste(gsub(' ', '', tolower(unique(full_data$algorithm))), collapse='_'), p, k)
         } else {
           filename <- sprintf('%s_p%i_k%i_i%i.RData', paste(gsub(' ', '', tolower(unique(full_data$algorithm))), collapse='_'), p, k, i)
         }
-      }
+#     }
       if (save_data) save.image(filename)  # save before plotting since ggplot can crash
       all_plots <- c(all_plots, unlist(lapply(split(full_data, full_data$k), bien_tibs_plots), recursive=FALSE))
       if (save_data) save.image(filename)  # re-save with plots
@@ -370,6 +373,10 @@ cov_glasso_sim <- function(estimators, p, n, N, num_sparsity_levels=401, save_da
 
 # Should run in < 1hr; can reduce # of penalty parameters tested for sparser/faster plot
 times_small <- function() {
+  #source("http://bioconductor.org/biocLite.R"); biocLite(); biocLite("genefilter")
+  library(Biobase)
+  library(genefilter)
+
   set.seed(1)
   load('nkitiny.RData')
   n <- ncol(exprs(nkitiny))
@@ -434,7 +441,11 @@ times_small <- function() {
 
 # Values are hard-coded here since they were computed on many servers in parallel
 # Running everything below on a single machine will take days/weeks
-times_reduced <- function() {
+times_large  <- function() {
+  #source("http://bioconductor.org/biocLite.R"); biocLite(); biocLite("genefilter")
+  library(Biobase)
+  library(genefilter)
+
   load('nkireduced.RData')
   n <- ncol(exprs(nkireduced))
   p <- nrow(exprs(nkireduced))
@@ -502,4 +513,59 @@ times_reduced <- function() {
 	time_data <- time_data[time_data$nnz <= max(stein_nnz_list),]
 	gp <- ggplot(time_data, aes(x=nnz, y=time, color=algorithm, shape=algorithm)) + geom_point() + ylab('time (sec)') + xlab('number of edges') + theme(legend.title=element_blank()) + theme(text=element_text(size=16)) + scale_y_log10(breaks=10^(1:5))
   return(list(times=time_data, plot=gp))
+}
+
+cv_test <- function() {
+  set.seed(2)
+  p <- 100
+  n <- 200
+  num_blocks <- 5
+  nz_prob <- 0.02
+  MA_const <- 0.4
+  Sigma <- bien_tibs_sigmas(p, num_blocks, nz_prob, MA_const, p)[[4]]
+  X <- rmvnorm(n=n, sigma=Sigma)
+  S <- t(X) %*% X
+  cv_type <- 'regression'
+
+  rho_range <- 1 / lseq(0.5,1e4,len=51)
+  lambda_range <- c(0.05, 0.1, 0.15)
+  rho_table <- matrix(NA,length(lambda_range),length(rho_range))
+  for (i in seq_along(lambda_range)) {
+    rho_table[i,] <- colMeans(cv(rho_range, X, function(X_i,rho) {
+      list(Omega=solve(sparse_stein_cov(nrow(X_i)*cov(X_i), nrow(X_i), lambda_range[i], rho)$Theta))
+    }, type=cv_type))
+  }
+  rho_plot <- melt(t(rho_table))
+  colnames(rho_plot) <- c('rho','lambda','Residual')
+  rho_plot[,1] <- rho_range[rho_plot[,1]]
+  rho_plot[,2] <- lambda_range[rho_plot[,2]]
+  gp_rho <- ggplot(rho_plot, aes(x=rho, y=Residual, color=as.factor(lambda), shape=as.factor(lambda))) + geom_line() + geom_point() + scale_x_log10(breaks=c(0.0001,0.001,0.01,0.1,1)) + scale_y_continuous(limits=c(1.8,2.75)) + xlab(expression(rho)) + guides(color=guide_legend(title=expression(lambda/rho)),shape=guide_legend(title=expression(lambda/rho)))
+
+  rho_range <- 1 / c(10,100,1000)
+  lambda_range <- seq(0,0.5,len=51)[-1]
+  lambda_table <- matrix(NA,length(rho_range),length(lambda_range))
+  for (i in seq_along(rho_range)) {
+    lambda_table[i,] <- colMeans(cv(lambda_range, X, function(X_i,lambda) {
+      list(Omega=solve(sparse_stein_cov(nrow(X_i)*cov(X_i), nrow(X_i), lambda, rho_range[i])$Theta))
+    }, type=cv_type))
+  }
+  lambda_plot <- melt(t(lambda_table))
+  colnames(lambda_plot) <- c('lambda','rho','Residual')
+  lambda_plot[,1] <- lambda_range[lambda_plot[,1]]
+  lambda_plot[,2] <- rho_range[lambda_plot[,2]]
+  gp_lambda <- ggplot(lambda_plot, aes(x=lambda, y=Residual, color=as.factor(rho), shape=as.factor(rho))) + geom_line() + geom_point() + scale_y_continuous(limits=c(1.8,2.75)) + xlab(expression(lambda/rho)) + guides(color=guide_legend(title=expression(rho)),shape=guide_legend(title=expression(rho)))
+  return(list(gp_lambda, gp_rho))
+}
+
+summary_table <- function(output) {
+  cv_rows <- output[NULL,]
+  output <- output[!is.na(output$cv_score) & !is.nan(output$entropy),]
+  for (i in unique(output$i)) {
+    sample_rows <- output[output$i == i,]
+    cv_rows <- rbind(cv_rows, sample_rows[which.min(sample_rows$cv_score)[1],])
+  }
+  means <- colMeans(output[,c(10,11,14,15)])
+  ses <- apply(output[,c(10,11,14,15)], 2, sd) / sqrt(50)
+  cat(sprintf('%f', as.numeric(rbind(means, ses))))
+  cat('\n')
 }
